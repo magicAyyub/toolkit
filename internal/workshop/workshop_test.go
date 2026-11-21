@@ -40,7 +40,7 @@ func TestParseBudget(t *testing.T) {
 	}
 }
 
-func TestChooseGPU(t *testing.T) {
+func TestMatchGPU(t *testing.T) {
 	gpu := func(id, name string, secure float64, availability string) runpod.GPUType {
 		return runpod.GPUType{ID: id, Name: name, Secure: true, Price: runpod.GPUPrice{Secure: secure}, Availability: availability}
 	}
@@ -67,15 +67,15 @@ func TestChooseGPU(t *testing.T) {
 		{"H200", 5.00, ""},     // unknown
 	}
 	for _, c := range cases {
-		got, err := chooseGPU(catalog, c.wanted, "SECURE", c.maxPrice)
+		got, err := MatchGPU(catalog, c.wanted, "SECURE", c.maxPrice)
 		if c.wantID == "" {
 			if err == nil {
-				t.Errorf("chooseGPU(%q, max $%.2f) = %s, want an error", c.wanted, c.maxPrice, got.ID)
+				t.Errorf("MatchGPU(%q, max $%.2f) = %s, want an error", c.wanted, c.maxPrice, got.ID)
 			}
 			continue
 		}
 		if err != nil || got.ID != c.wantID {
-			t.Errorf("chooseGPU(%q, max $%.2f) = %q, %v; want %q", c.wanted, c.maxPrice, got.ID, err, c.wantID)
+			t.Errorf("MatchGPU(%q, max $%.2f) = %q, %v; want %q", c.wanted, c.maxPrice, got.ID, err, c.wantID)
 		}
 	}
 }

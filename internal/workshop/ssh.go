@@ -19,12 +19,21 @@ const (
 	// Failed probes are normal while sshd starts; only report the ssh error
 	// once it keeps failing.
 	probeFailuresBeforeReport = 3
+	// RunPod can briefly report no SSH port for a running pod, e.g. right
+	// after a session dropped.
+	endpointWaitTimeout = 30 * time.Second
 )
 
-// checkSSHKey makes sure ssh will be able to use the key without prompting,
+// Shortened by tests.
+var (
+	pollInterval      = 5 * time.Second
+	podGoneRetryDelay = 3 * time.Second
+)
+
+// CheckSSHKey makes sure ssh will be able to use the key without prompting,
 // before we pay for a pod: either the private key has no passphrase, or the
 // key is loaded in ssh-agent.
-func checkSSHKey(publicKeyPath string) error {
+func CheckSSHKey(publicKeyPath string) error {
 	privateKeyPath := strings.TrimSuffix(publicKeyPath, ".pub")
 	if _, err := os.Stat(privateKeyPath); err != nil {
 		return fmt.Errorf("SSH private key %s not found (expected next to %s)", privateKeyPath, publicKeyPath)
@@ -53,10 +62,58 @@ func checkSSHKey(publicKeyPath string) error {
 	return fmt.Errorf("SSH key %s needs a passphrase and is not loaded in ssh-agent.\nLoad it first with: ssh-add %s", privateKeyPath, privateKeyPath)
 }
 
-// waitForSSH polls the pod until it is running with a public SSH port, then
-// until sshd actually accepts our key (the image sets it up after boot). It
-// gives up early when RunPod reports that the pod can't start.
-func waitForSSH(ctx context.Context, client *runpod.Client, podID, sshKey string, debug bool) (runpod.Pod, runpod.SSHEndpoint, error) {
+// Waiting for a new pod
+
+// Event reports progress while waiting for a pod. Exactly one field is set.
+type Event struct {
+	Phase  string // what is happening now, e.g. "Starting the machine"
+	Notice string // something the user should see, e.g. a repeated ssh error
+	Debug  string // details only useful with --debug
+}
+
+// AbandonedError means WaitUntilReady gave up. Since it can't tell whether the
+// guardian ever started, it deleted the pod rather than leave it unprotected.
+type AbandonedError struct {
+	Cause         error
+	PodID         string
+	EstimatedCost float64
+	DeleteErr     error // set if the pod could not be deleted and may still cost money
+}
+
+func (e *AbandonedError) Error() string {
+	if e.DeleteErr != nil {
+		return fmt.Sprintf("%v\ncould not delete pod %s (%v). It may keep costing money: delete it from the RunPod console", e.Cause, e.PodID, e.DeleteErr)
+	}
+	return e.Cause.Error()
+}
+
+func (e *AbandonedError) Unwrap() error {
+	return e.Cause
+}
+
+// WaitUntilReady waits until the new pod is running and sshd accepts our key.
+// It gives up early when RunPod reports that the pod can't start, after
+// sshWaitTimeout, or when ctx is cancelled (Ctrl-C), and then deletes the pod:
+// the error is an *AbandonedError.
+func WaitUntilReady(ctx context.Context, client *runpod.Client, info Info, sshKey string, report func(Event)) (Info, runpod.SSHEndpoint, error) {
+	pod, endpoint, err := waitForSSH(ctx, client, info.Pod.ID, sshKey, report)
+	if err == nil {
+		info.Pod = pod
+		return info, endpoint, nil
+	}
+
+	// A fresh context: ctx may be the one Ctrl-C just cancelled.
+	deleteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return info, runpod.SSHEndpoint{}, &AbandonedError{
+		Cause:         err,
+		PodID:         info.Pod.ID,
+		EstimatedCost: info.EstimatedCost(),
+		DeleteErr:     Delete(deleteCtx, client, info),
+	}
+}
+
+func waitForSSH(ctx context.Context, client *runpod.Client, podID, sshKey string, report func(Event)) (runpod.Pod, runpod.SSHEndpoint, error) {
 	ctx, cancel := context.WithTimeout(ctx, sshWaitTimeout)
 	defer cancel()
 
@@ -73,10 +130,11 @@ func waitForSSH(ctx context.Context, client *runpod.Client, podID, sshKey string
 			}
 		})
 		if err != nil && ctx.Err() == nil {
-			fmt.Printf("\n  (can't read RunPod system logs, watching the pod status only: %v)\n  still waiting", err)
+			report(Event{Debug: fmt.Sprintf("can't read RunPod system logs, watching the pod status only: %v", err)})
 		}
 	}()
 
+	report(Event{Phase: "Starting the machine"})
 	status := "not reported yet"
 	probing := false
 	probeFailures := 0
@@ -97,22 +155,22 @@ func waitForSSH(ctx context.Context, client *runpod.Client, podID, sshKey string
 			if status == "RUNNING" && pod.SSH.Direct != nil {
 				endpoint := *pod.SSH.Direct
 				if !probing {
-					fmt.Printf(" on %s ", endpointAddress(endpoint))
+					report(Event{Phase: "Waiting for SSH on " + endpointAddress(endpoint)})
 					probing = true
 				}
-				probeError := probeSSH(endpoint, sshKey, debug)
-				if probeError == "" {
+				probe := probeSSH(endpoint, sshKey)
+				report(Event{Debug: probe.debugText()})
+				if probe.ok() {
 					return pod, endpoint, nil
 				}
 				probeFailures++
-				lastProbeError = probeError
-				if probeFailures >= probeFailuresBeforeReport && probeError != lastReportedError {
-					fmt.Printf("\n  ssh %s: %s\n  still waiting", endpointAddress(endpoint), probeError)
-					lastReportedError = probeError
+				lastProbeError = probe.failure()
+				if probeFailures >= probeFailuresBeforeReport && lastProbeError != lastReportedError {
+					report(Event{Notice: fmt.Sprintf("ssh %s: %s", endpointAddress(endpoint), lastProbeError)})
+					lastReportedError = lastProbeError
 				}
 			}
 		}
-		fmt.Print(".")
 
 		select {
 		case line := <-startupErrors:
@@ -125,17 +183,25 @@ func waitForSSH(ctx context.Context, client *runpod.Client, podID, sshKey string
 				return runpod.Pod{}, runpod.SSHEndpoint{}, fmt.Errorf("SSH still not reachable after %s: %s", sshWaitTimeout, lastProbeError)
 			}
 			return runpod.Pod{}, runpod.SSHEndpoint{}, fmt.Errorf("the pod never became reachable: status still %s after %s", status, sshWaitTimeout)
-		case <-time.After(5 * time.Second):
+		case <-time.After(pollInterval):
 		}
 	}
 }
 
-// probeSSH runs a no-op command and returns ssh's error output, or "" on success.
+type probeResult struct {
+	command  string
+	exitCode int // -1 when ssh could not be started at all
+	duration time.Duration
+	output   string
+	err      error
+}
+
+// probeSSH runs a no-op command over SSH.
 //
 // The probe doesn't check or record the host key, so nothing seen while the
 // pod boots ends up in its known_hosts file. It only runs "true", so there is
 // nothing to protect; the interactive session does the trust-on-first-use check.
-func probeSSH(endpoint runpod.SSHEndpoint, sshKey string, debug bool) string {
+func probeSSH(endpoint runpod.SSHEndpoint, sshKey string) probeResult {
 	options := []string{
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "StrictHostKeyChecking=no",
@@ -146,33 +212,43 @@ func probeSSH(endpoint runpod.SSHEndpoint, sshKey string, debug bool) string {
 	probe := sshCommand(endpoint, sshKey, options, "true")
 	started := time.Now()
 	output, err := probe.CombinedOutput()
-	message := strings.TrimSpace(string(output))
 
-	if debug {
-		exitCode := 0
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else if err != nil {
-			exitCode = -1 // ssh could not be started at all
-		}
-		fmt.Printf("\n[debug] $ %s\n[debug] exit %d after %s", shellQuote(probe.Args), exitCode, time.Since(started).Round(time.Millisecond))
-		if message != "" {
-			fmt.Printf(", output:\n%s", message)
-		}
-		if err != nil && exitCode == -1 {
-			fmt.Printf(", error: %v", err)
-		}
-		fmt.Println()
+	result := probeResult{
+		command:  shellQuote(probe.Args),
+		duration: time.Since(started),
+		output:   strings.TrimSpace(string(output)),
+		err:      err,
 	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		result.exitCode = exitErr.ExitCode()
+	} else if err != nil {
+		result.exitCode = -1
+	}
+	return result
+}
 
-	if err == nil {
-		return ""
+func (r probeResult) ok() bool {
+	return r.err == nil
+}
+
+// failure is what went wrong, preferably in ssh's own words.
+func (r probeResult) failure() string {
+	if r.output != "" {
+		return r.output
 	}
-	if message != "" {
-		return message
+	return r.err.Error()
+}
+
+func (r probeResult) debugText() string {
+	text := fmt.Sprintf("$ %s\nexit %d after %s", r.command, r.exitCode, r.duration.Round(time.Millisecond))
+	if r.output != "" {
+		text += ", output:\n" + r.output
 	}
-	return err.Error()
+	if r.exitCode == -1 {
+		text += fmt.Sprintf(", error: %v", r.err)
+	}
+	return text
 }
 
 // shellQuote renders a command so it can be pasted into a shell as is.
@@ -188,80 +264,90 @@ func shellQuote(args []string) string {
 	return strings.Join(quoted, " ")
 }
 
-func runInteractiveSSH(ctx context.Context, client *runpod.Client, pod runpod.Pod, endpoint runpod.SSHEndpoint, sshKey string) error {
+// Connecting to an existing workshop
+
+// Endpoint returns the workshop's direct SSH endpoint, waiting up to
+// endpointWaitTimeout while RunPod reports none yet.
+func Endpoint(ctx context.Context, client *runpod.Client, info Info) (Info, runpod.SSHEndpoint, error) {
+	ctx, cancel := context.WithTimeout(ctx, endpointWaitTimeout)
+	defer cancel()
+
+	for {
+		// List results don't include live connection details; the single pod does.
+		pod, err := client.GetPod(ctx, info.Pod.ID)
+		if err == nil {
+			switch {
+			case pod.Status == "RUNNING" && pod.SSH.Direct != nil:
+				info.Pod = pod
+				return info, *pod.SSH.Direct, nil
+			case pod.Status == "EXITED" || pod.Status == "ERROR" || pod.Status == "TERMINATED":
+				return info, runpod.SSHEndpoint{}, fmt.Errorf("workshop %q is %s, not RUNNING", info.Name, pod.Status)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			if err != nil {
+				return info, runpod.SSHEndpoint{}, fmt.Errorf("reading workshop %q: %w", info.Name, err)
+			}
+			return info, runpod.SSHEndpoint{}, fmt.Errorf("workshop %q has no public SSH port after %s (status %s)", info.Name, endpointWaitTimeout, pod.Status)
+		case <-time.After(pollInterval / 2):
+		}
+	}
+}
+
+// Interactive session
+
+// RunSession connects the terminal to the workshop over SSH until the user
+// leaves or the connection drops; connectionLost tells which.
+func RunSession(info Info, endpoint runpod.SSHEndpoint, sshKey string, debug bool) (connectionLost bool, err error) {
 	options := []string{
 		// Pods reuse public IP:port pairs with fresh host keys, so the user's main
 		// known_hosts would raise mismatch errors. Each pod gets its own file,
 		// trusted on first use.
-		"-o", "UserKnownHostsFile=" + knownHostsFile(pod.ID),
+		"-o", "UserKnownHostsFile=" + knownHostsFile(info.Pod.ID),
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "ServerAliveInterval=30",
+	}
+	if !debug {
+		// Hides "Permanently added ... to the list of known hosts" on first connect.
+		options = append(options, "-o", "LogLevel=ERROR")
 	}
 	cmd := sshCommand(endpoint, sshKey, options)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	err = cmd.Run()
 
 	// A non-zero exit is usually just the remote shell's last status, or a
 	// dropped connection (255). Neither is an error for the toolkit.
 	var exitErr *exec.ExitError
 	if err != nil && !errors.As(err, &exitErr) {
-		return fmt.Errorf("running ssh: %w", err)
+		return false, fmt.Errorf("running ssh: %w", err)
 	}
-	connectionLost := exitErr != nil && exitErr.ExitCode() == 255
-
-	name := strings.TrimPrefix(pod.Name, podNamePrefix)
-	fmt.Println()
-	if connectionLost {
-		fmt.Println("Connection lost, checking the workshop...")
-	}
-	gone, checkErr := podGone(ctx, client, pod.ID, connectionLost)
-	if gone {
-		forgetHostKey(pod.ID)
-		info := readWorkshopEnv(pod)
-		reason := ""
-		if !info.deadline.IsZero() && !time.Now().Before(info.deadline) {
-			reason = " (budget reached)"
-		}
-		duration := time.Since(info.created)
-		fmt.Printf("The machine was deleted%s. Workshop %q is closed.\n", reason, name)
-		fmt.Printf("  Duration   %s\n", formatDuration(duration))
-		fmt.Printf("  Est. cost  ~$%.2f ($%.2f/h)\n", pod.Cost*duration.Hours(), pod.Cost)
-		return nil
-	}
-
-	if checkErr != nil {
-		fmt.Printf("Disconnected from workshop %q (could not check whether it still exists: %v).\n", name, checkErr)
-	} else {
-		fmt.Printf("Disconnected from workshop %q. It keeps running.\n", name)
-	}
-	fmt.Printf("  Reconnect  toolkit workshop connect %s\n", name)
-	fmt.Printf("  Close      toolkit workshop close %s\n", name)
-	if idle, err := strconv.Atoi(pod.Env[envIdleSeconds]); err == nil {
-		fmt.Printf("  If nothing runs on the GPU, it will be deleted after %s idle.\n", formatDuration(time.Duration(idle)*time.Second))
-	}
-	return nil
+	return exitErr != nil && exitErr.ExitCode() == 255, nil
 }
 
-// podGone reports whether the pod no longer exists. After a lost connection
-// it checks a few times, because the API can briefly lag behind a deletion
-// the guardian has just made.
-func podGone(ctx context.Context, client *runpod.Client, podID string, connectionLost bool) (bool, error) {
+// Gone reports whether the workshop's pod no longer exists. After a lost
+// connection it checks a few times, because the API can briefly lag behind a
+// deletion the guardian has just made.
+func Gone(ctx context.Context, client *runpod.Client, info Info, connectionLost bool) (bool, error) {
 	attempts := 1
 	if connectionLost {
 		attempts = 4
 	}
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		pod, err := client.GetPod(ctx, podID)
+		pod, err := client.GetPod(ctx, info.Pod.ID)
 		var apiErr *runpod.APIError
 		switch {
 		case errors.As(err, &apiErr) && apiErr.Status == 404:
+			forgetHostKey(info.Pod.ID)
 			return true, nil
 		case err != nil:
 			lastErr = err
 		case pod.Status == "TERMINATED":
+			forgetHostKey(info.Pod.ID)
 			return true, nil
 		default:
 			lastErr = nil
@@ -273,7 +359,7 @@ func podGone(ctx context.Context, client *runpod.Client, podID string, connectio
 	return false, lastErr
 }
 
-var podGoneRetryDelay = 3 * time.Second // shortened by tests
+// SSH plumbing
 
 // sshCommand builds "ssh <options> user@host <remote command>". ssh takes
 // everything after the destination as the remote command, so options must

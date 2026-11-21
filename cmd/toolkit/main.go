@@ -7,9 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"toolkit/internal/runpod"
 	"toolkit/internal/workshop"
@@ -24,9 +24,16 @@ const usage = `Usage:
 "ws" is a short alias for "workshop". Run "toolkit workshop open -h" for open's flags.
 `
 
+// errReported means the problem has already been shown to the user: exit
+// with a failure status without printing anything more.
+var errReported = errors.New("already reported")
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+	err := run(os.Args[1:])
+	if err != nil && !errors.Is(err, errReported) {
+		printError(err)
+	}
+	if err != nil {
 		os.Exit(1)
 	}
 }
@@ -37,7 +44,11 @@ func run(args []string) error {
 		os.Exit(2)
 	}
 	command, args := args[1], args[2:]
-	ctx := context.Background()
+
+	// Ctrl-C cancels whatever is in progress. Prompts and the SSH session read
+	// Ctrl-C as a key instead, so this only applies while the toolkit waits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	config, err := readConfig()
 	if err != nil {
@@ -55,58 +66,27 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		return workshop.Connect(ctx, client, name, expandHome(*sshKey))
+		return connectWorkshop(ctx, client, name, expandHome(*sshKey))
 	case "list":
 		client, err := config.newClient()
 		if err != nil {
 			return err
 		}
-		return workshop.List(ctx, client)
+		return listWorkshops(ctx, client)
 	case "close":
 		flags := flag.NewFlagSet("close", flag.ExitOnError)
-		yes := flags.Bool("yes", false, "don't ask for confirmation")
+		yes := flags.Bool("yes", false, "don't ask for confirmation (required when not on a terminal)")
 		name := parseWithName(flags, args)
 		client, err := config.newClient()
 		if err != nil {
 			return err
 		}
-		return workshop.Close(ctx, client, name, *yes)
+		return closeWorkshop(ctx, client, name, *yes)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
 	return nil
-}
-
-func openWorkshop(ctx context.Context, config configFile, args []string) error {
-	flags := flag.NewFlagSet("open", flag.ExitOnError)
-	gpu := flags.String("gpu", "RTX 4090", "GPU type, as named in the RunPod catalog")
-	maxPrice := flags.Float64("max-price", 1.00, "maximum price in USD per hour")
-	budget := flags.String("budget", "$3", `budget as a duration ("2h", "90m") or dollars ("$5")`)
-	idle := flags.Duration("idle", 30*time.Minute, "delete after this long with no SSH session and GPU at rest")
-	community := flags.Bool("community", false, "use the community cloud (cheaper, less reliable)")
-	debug := flags.Bool("debug", false, "print each SSH probe command with its exit code and output")
-	sshKey := flags.String("ssh-key", config.sshKey(), "SSH public key installed on the machine")
-	name := parseWithName(flags, args)
-
-	parsedBudget, err := workshop.ParseBudget(*budget)
-	if err != nil {
-		return err
-	}
-	client, err := config.newClient()
-	if err != nil {
-		return err
-	}
-	return workshop.Open(ctx, client, workshop.OpenOptions{
-		Name:        name,
-		GPU:         *gpu,
-		MaxPrice:    *maxPrice,
-		Budget:      parsedBudget,
-		IdleTimeout: *idle,
-		Community:   *community,
-		Debug:       *debug,
-		SSHKey:      expandHome(*sshKey),
-	})
 }
 
 // parseWithName parses flags placed before or after the single positional
@@ -129,8 +109,9 @@ func parseWithName(flags *flag.FlagSet, args []string) string {
 // configFile holds the "key = value" settings from ~/.config/toolkit/config.
 // Known keys: runpod_api_key, ssh_key.
 type configFile struct {
-	path     string
-	settings map[string]string
+	path       string
+	settings   map[string]string
+	apiBaseURL string // only set by tests, to point at a fake API
 }
 
 func readConfig() (configFile, error) {
@@ -164,13 +145,18 @@ func readConfig() (configFile, error) {
 
 // newClient uses RUNPOD_API_KEY, or runpod_api_key from the config file.
 func (c configFile) newClient() (*runpod.Client, error) {
-	if key := os.Getenv("RUNPOD_API_KEY"); key != "" {
-		return runpod.NewClient(key), nil
+	key := os.Getenv("RUNPOD_API_KEY")
+	if key == "" {
+		key = c.settings["runpod_api_key"]
 	}
-	if key := c.settings["runpod_api_key"]; key != "" {
-		return runpod.NewClient(key), nil
+	if key == "" {
+		return nil, fmt.Errorf("no RunPod API key: set RUNPOD_API_KEY or add \"runpod_api_key = ...\" to %s", c.path)
 	}
-	return nil, fmt.Errorf("no RunPod API key: set RUNPOD_API_KEY or add \"runpod_api_key = ...\" to %s", c.path)
+	client := runpod.NewClient(key)
+	if c.apiBaseURL != "" {
+		client.BaseURL = c.apiBaseURL
+	}
+	return client, nil
 }
 
 // sshKey is the default for --ssh-key: ssh_key from the config file, or ~/.ssh/id_ed25519.pub.

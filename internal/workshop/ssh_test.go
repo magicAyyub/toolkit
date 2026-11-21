@@ -43,11 +43,11 @@ func TestCheckSSHKey(t *testing.T) {
 	t.Cleanup(func() { exec.Command("kill", agentPID[1]).Run() })
 	t.Setenv("SSH_AUTH_SOCK", agentSocket)
 
-	if err := checkSSHKey(plainKey); err != nil {
+	if err := CheckSSHKey(plainKey); err != nil {
 		t.Errorf("key without passphrase: %v", err)
 	}
 
-	err = checkSSHKey(protectedKey)
+	err = CheckSSHKey(protectedKey)
 	if err == nil || !strings.Contains(err.Error(), "needs a passphrase and is not loaded in ssh-agent") {
 		t.Errorf("protected key not in agent: got %v", err)
 	}
@@ -60,11 +60,11 @@ func TestCheckSSHKey(t *testing.T) {
 	if output, err := add.CombinedOutput(); err != nil {
 		t.Fatalf("ssh-add: %v\n%s", err, output)
 	}
-	if err := checkSSHKey(protectedKey); err != nil {
+	if err := CheckSSHKey(protectedKey); err != nil {
 		t.Errorf("protected key loaded in agent: %v", err)
 	}
 
-	if err := checkSSHKey(filepath.Join(dir, "missing.pub")); err == nil || !strings.Contains(err.Error(), "not found") {
+	if err := CheckSSHKey(filepath.Join(dir, "missing.pub")); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Errorf("missing key: got %v", err)
 	}
 }
@@ -122,26 +122,30 @@ func TestProbeSSHAgainstRealServer(t *testing.T) {
 	current, _ := user.Current()
 	endpoint := runpod.SSHEndpoint{Host: "127.0.0.1", Port: port, Username: current.Username}
 
-	probeError := "not tried"
-	for attempt := 0; attempt < 20 && probeError != ""; attempt++ {
-		probeError = probeSSH(endpoint, filepath.Join(dir, "client_key.pub"), false)
-		if probeError != "" {
-			time.Sleep(100 * time.Millisecond)
+	var probe probeResult
+	for attempt := 0; attempt < 20; attempt++ {
+		probe = probeSSH(endpoint, filepath.Join(dir, "client_key.pub"))
+		if probe.ok() {
+			break
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	if probeError != "" {
-		t.Fatalf("probe against a working sshd failed: %s\nsshd log:\n%s", probeError, sshdLog.String())
+	if !probe.ok() {
+		t.Fatalf("probe against a working sshd failed: %s\nsshd log:\n%s", probe.failure(), sshdLog.String())
+	}
+	if !strings.Contains(probe.debugText(), "exit 0") || !strings.HasSuffix(probe.command, " true") {
+		t.Errorf("unexpected debug text:\n%s", probe.debugText())
 	}
 
 	// A key the server doesn't know must fail, and the error must say why.
 	keygen(filepath.Join(dir, "unknown_key"))
 	t.Setenv("SSH_AUTH_SOCK", "") // keep the user's agent keys out of it
-	if message := probeSSH(endpoint, filepath.Join(dir, "unknown_key.pub"), false); !strings.Contains(message, "Permission denied") {
-		t.Errorf("expected a permission error with an unknown key, got %q", message)
+	if probe := probeSSH(endpoint, filepath.Join(dir, "unknown_key.pub")); probe.ok() || !strings.Contains(probe.failure(), "Permission denied") {
+		t.Errorf("expected a permission error with an unknown key, got %q", probe.failure())
 	}
 }
 
-func TestPodGone(t *testing.T) {
+func TestGone(t *testing.T) {
 	defaultDelay := podGoneRetryDelay
 	podGoneRetryDelay = time.Millisecond
 	t.Cleanup(func() { podGoneRetryDelay = defaultDelay })
@@ -175,7 +179,7 @@ func TestPodGone(t *testing.T) {
 			client := runpod.NewClient("test-key")
 			client.BaseURL = api.URL
 
-			gone, err := podGone(t.Context(), client, "pod-1", c.connectionLost)
+			gone, err := Gone(t.Context(), client, Info{Pod: runpod.Pod{ID: "pod-1"}}, c.connectionLost)
 			if gone != c.wantGone || (err != nil) != c.wantErr || calls != c.wantCalls {
 				t.Errorf("got gone=%v err=%v after %d calls; want gone=%v err=%v after %d calls",
 					gone, err, calls, c.wantGone, c.wantErr, c.wantCalls)
